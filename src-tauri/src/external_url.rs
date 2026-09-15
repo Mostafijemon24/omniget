@@ -157,6 +157,11 @@ pub async fn queue_url_with_defaults(
     let ext_headers = ext_meta.as_ref().and_then(|m| m.headers.clone());
     let ext_page_url = ext_meta.as_ref().and_then(|m| m.page_url.clone());
     let ext_user_agent = ext_meta.as_ref().and_then(|m| m.user_agent.clone());
+    // Explicit resolution/format picked in the browser's in-page menu. When
+    // present these override the app's default quality so the download starts
+    // immediately at the chosen resolution (IDM-style).
+    let ext_quality = ext_meta.as_ref().and_then(|m| m.quality.clone());
+    let ext_format_id = ext_meta.as_ref().and_then(|m| m.format_id.clone());
 
     let ext_media_info = ext_meta.as_ref().and_then(|m| {
         let mt = m.media_type.as_deref()?;
@@ -248,8 +253,8 @@ pub async fn queue_url_with_defaults(
             queue_title,
             output_dir,
             download_mode,
-            None,
-            None,
+            ext_quality,
+            ext_format_id,
             ext_referer,
             ext_headers,
             ext_page_url,
@@ -321,7 +326,12 @@ pub async fn handle_external_url(
     }
 
     let settings = config::load_settings(app);
-    let can_queue_directly = (!settings.download.always_ask_path
+    // An explicit quality selection from the browser's in-page menu is a
+    // direct "download now" intent — honour it even when the user's default is
+    // "always ask where to save", as long as we have somewhere to put the file.
+    let has_explicit_quality = crate::extension_storage::peek_extension_quality(&url).is_some();
+    let can_queue_directly = (has_explicit_quality
+        || !settings.download.always_ask_path
         || settings.download.auto_download_on_paste)
         && has_valid_output_dir(&settings.download.default_output_dir);
 

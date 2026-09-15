@@ -18,6 +18,7 @@ import { isSyntheticManifestUrl } from "./synthetic-manifest.js";
 import {
   sendViaBridge,
   sendCookiesViaBridge,
+  getFormatsViaBridge,
   autoPair,
   loadBridgeConfig,
   AUTOPAIR_ALARM_NAME,
@@ -126,9 +127,44 @@ loadDeepSearchState().catch(() => {});
 loadH264State().catch(() => {});
 restoreMedia().catch(() => {});
 
+const VIDEO_DETECT_FILE = "content/video-detect.js";
+
+// Reloading an unpacked extension kills the old isolated world and does NOT
+// re-inject manifest content scripts into already-open tabs. Push the in-page
+// button back in so a YouTube tab the user is staring at gets the FAB without
+// a manual page refresh.
+async function injectVideoDetect(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: [VIDEO_DETECT_FILE],
+    });
+  } catch {
+    // chrome://, Web Store, PDFs, and hosts we have no permission for throw.
+  }
+}
+
+async function injectVideoDetectIntoOpenTabs() {
+  if (!chrome.tabs?.query) return;
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch {
+    return;
+  }
+  for (const tab of tabs) {
+    if (!tab?.id || tab.id === chrome.tabs.TAB_ID_NONE) continue;
+    const url = typeof tab.url === "string" ? tab.url : "";
+    if (!/^https?:/i.test(url)) continue;
+    void injectVideoDetect(tab.id);
+  }
+}
+
 chrome.runtime.onInstalled.addListener(async (details) => {
   registerContextMenu();
   refreshActiveTab().catch(() => {});
+  injectVideoDetectIntoOpenTabs().catch(() => {});
   // Surface the pairing page on any install/update *if the user hasn't
   // already paired this browser*. Reloading an unpacked extension fires
   // `update`, not `install`, so gating only on `install` would silently
@@ -279,6 +315,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // In-page IDM-style picker: list available resolutions for the current page.
+  if (msg.type === "getFormats") {
+    handleGetFormats(msg).then(sendResponse).catch((error) =>
+      sendResponse({ ok: false, reason: "error", message: error?.message })
+    );
+    return true;
+  }
+
+  // In-page IDM-style picker: download the page at the chosen resolution.
+  if (msg.type === "downloadWithQuality") {
+    const detected = detectSupportedMediaUrl(msg.url);
+    handleSendToApp({
+      type: "sendToOmniGet",
+      url: msg.url,
+      platform: detected?.platform || "generic",
+      referer: msg.referer || msg.url,
+      quality: msg.quality,
+      formatId: msg.formatId,
+    })
+      .then(sendResponse)
+      .catch((error) =>
+        sendResponse({ ok: false, error: error?.message || "Download failed" })
+      );
+    return true;
+  }
+
   // Deep search runs in the page and finds playlists the network layer never
   // sees as media. The manifest text itself stays in the content script (it can
   // be hundreds of KB); we only fetch it at send time, from the tab that has it.
@@ -367,6 +429,61 @@ function updateBadge(tabId) {
   }).catch(() => {});
 }
 
+// Collect the cookies the desktop app needs to fetch a URL: prefer the
+// platform-specific set, otherwise fall back to whatever applies to the media
+// URL and its page. Shared by the send-to-app and formats-probe paths.
+async function gatherCookiesForRequest(url, referer, platform) {
+  try {
+    const platformCookies = await extractCookiesForPlatform(platform);
+    if (platformCookies && platformCookies.length > 0) {
+      return platformCookies;
+    }
+  } catch {}
+
+  try {
+    const cookieMap = new Map();
+    const cdnCookies = await chrome.cookies.getAll({ url });
+    for (const c of cdnCookies) {
+      cookieMap.set(`${c.domain}:${c.name}`, c);
+    }
+    if (referer) {
+      try {
+        const pageCookies = await chrome.cookies.getAll({ url: referer });
+        for (const c of pageCookies) {
+          cookieMap.set(`${c.domain}:${c.name}`, c);
+        }
+      } catch {}
+    }
+    if (cookieMap.size > 0) {
+      return [...cookieMap.values()].map((c) => ({
+        domain: c.domain,
+        httpOnly: c.httpOnly,
+        path: c.path,
+        secure: c.secure,
+        expires: c.expirationDate ? Math.floor(c.expirationDate) : 0,
+        name: c.name,
+        value: c.value,
+        hostOnly: c.hostOnly,
+        sameSite: c.sameSite,
+      }));
+    }
+  } catch {}
+
+  return null;
+}
+
+// Probe a page for its available resolutions on behalf of the in-page picker.
+async function handleGetFormats(msg) {
+  const url = msg.url;
+  if (!url) return { ok: false, reason: "missing-url" };
+  const detected = detectSupportedMediaUrl(url);
+  const platform = detected?.platform || "generic";
+  const cookies = await gatherCookiesForRequest(url, url, platform);
+  const payload = { url, referer: url };
+  if (cookies && cookies.length > 0) payload.cookies = cookies;
+  return getFormatsViaBridge(payload);
+}
+
 async function handleSendToApp(msg) {
   const url = msg.url;
   const platform = msg.platform || "generic";
@@ -379,43 +496,7 @@ async function handleSendToApp(msg) {
     pageThumbnail = tab?.favIconUrl || "";
   } catch {}
 
-  let cookies = null;
-  try {
-    const platformCookies = await extractCookiesForPlatform(platform);
-    if (platformCookies && platformCookies.length > 0) {
-      cookies = platformCookies;
-    } else {
-      const cookieMap = new Map();
-
-      const cdnCookies = await chrome.cookies.getAll({ url });
-      for (const c of cdnCookies) {
-        cookieMap.set(`${c.domain}:${c.name}`, c);
-      }
-
-      if (msg.referer) {
-        try {
-          const pageCookies = await chrome.cookies.getAll({ url: msg.referer });
-          for (const c of pageCookies) {
-            cookieMap.set(`${c.domain}:${c.name}`, c);
-          }
-        } catch {}
-      }
-
-      if (cookieMap.size > 0) {
-        cookies = [...cookieMap.values()].map(c => ({
-          domain: c.domain,
-          httpOnly: c.httpOnly,
-          path: c.path,
-          secure: c.secure,
-          expires: c.expirationDate ? Math.floor(c.expirationDate) : 0,
-          name: c.name,
-          value: c.value,
-          hostOnly: c.hostOnly,
-          sameSite: c.sameSite,
-        }));
-      }
-    }
-  } catch {}
+  const cookies = await gatherCookiesForRequest(url, msg.referer, platform);
 
   const message = { type: "enqueue", url, protocolVersion: PROTOCOL_VERSION };
   if (cookies) message.cookies = cookies;
@@ -425,6 +506,10 @@ async function handleSendToApp(msg) {
   if (msg.thumbnail) message.thumbnail = msg.thumbnail;
   else if (pageThumbnail) message.thumbnail = pageThumbnail;
   if (msg.mediaType) message.mediaType = msg.mediaType;
+  // Explicit resolution picked in the in-page menu (IDM-style). The desktop
+  // app downloads this quality directly instead of prompting.
+  if (msg.quality) message.quality = msg.quality;
+  if (msg.formatId) message.formatId = msg.formatId;
   if (msg.hasManifest) {
     let tabId = msg.tabId;
     if (typeof tabId !== "number") {

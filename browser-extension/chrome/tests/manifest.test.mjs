@@ -128,6 +128,26 @@ test("declares scripting permission so deep search can register content scripts"
   assert.ok(manifest.permissions.includes("scripting"));
 });
 
+test("injects the in-page download button as a top-frame content script", async () => {
+  const manifest = await readManifest();
+  const scripts = manifest.content_scripts || [];
+  const videoDetect = scripts.find((entry) =>
+    Array.isArray(entry.js) && entry.js.includes("content/video-detect.js")
+  );
+  assert.ok(videoDetect, "content/video-detect.js must be declared");
+  assert.ok(videoDetect.matches?.includes("https://*/*"));
+  assert.equal(videoDetect.all_frames, false);
+});
+
+test("in-page button script never assigns innerHTML (YouTube Trusted Types)", async () => {
+  const src = await readFile(new URL("../content/video-detect.js", import.meta.url), "utf8");
+  assert.doesNotMatch(
+    src,
+    /\.innerHTML\s*=/,
+    "innerHTML assignment is blocked by YouTube Trusted Types and would hide the button",
+  );
+});
+
 test("the firefox manifest keeps the permissions deep search depends on", async () => {
   const firefox = JSON.parse(
     await readFile(new URL("../../firefox/manifest.json", import.meta.url), "utf8")

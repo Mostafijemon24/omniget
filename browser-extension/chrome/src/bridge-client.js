@@ -292,6 +292,94 @@ export async function sendViaBridge(
   };
 }
 
+// Probe a URL for its available resolutions/formats via the desktop app's
+// `/v1/formats` endpoint. Returns `{ ok, title, qualities, ... }` on success,
+// or `{ ok: false, reason, message }` mirroring `sendViaBridge`'s error shape
+// so the in-page picker can show a helpful message.
+export async function getFormatsViaBridge(
+  payload,
+  {
+    fetchImpl = typeof fetch !== "undefined" ? fetch : null,
+    storage = globalThis.chrome?.storage?.local,
+    timeoutMs = 20000,
+    config = null,
+  } = {}
+) {
+  if (!fetchImpl) {
+    return { ok: false, reason: "no-fetch" };
+  }
+
+  const resolved = config ?? (await loadBridgeConfig({ storage }));
+  const endpoint = trimEndpoint(resolved.endpoint);
+  const token = typeof resolved.token === "string" ? resolved.token.trim() : "";
+
+  if (!endpoint) return { ok: false, reason: "missing-endpoint" };
+  if (!token) return { ok: false, reason: "missing-token" };
+
+  const body = { ...payload, protocolVersion: PROTOCOL_VERSION };
+
+  const controller =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  let response;
+  try {
+    response = await withTimeout(
+      fetchImpl(`${endpoint}/v1/formats`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller?.signal,
+      }),
+      timeoutMs,
+      controller
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      reason: "fetch-failed",
+      message: error?.message ?? String(error),
+    };
+  }
+
+  let parsed = null;
+  try {
+    parsed = await response.json();
+  } catch {
+    parsed = null;
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    await handleUnauthorized(storage);
+    return {
+      ok: false,
+      reason: "unauthorized",
+      status: response.status,
+      message: parsed?.message ?? "Bridge rejected the bearer token",
+    };
+  }
+  if (!response.ok) {
+    return {
+      ok: false,
+      reason: "http-error",
+      status: response.status,
+      code: parsed?.code ?? null,
+      message: parsed?.message ?? `HTTP ${response.status}`,
+    };
+  }
+
+  return {
+    ok: Boolean(parsed?.ok ?? false),
+    title: parsed?.title ?? null,
+    thumbnail: parsed?.thumbnail ?? null,
+    mediaType: parsed?.mediaType ?? null,
+    durationSeconds: parsed?.durationSeconds ?? null,
+    qualities: Array.isArray(parsed?.qualities) ? parsed.qualities : [],
+    message: parsed?.message ?? null,
+  };
+}
+
 export async function sendCookiesViaBridge(
   cookies,
   {

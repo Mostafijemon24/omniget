@@ -223,6 +223,7 @@ pub async fn spawn(app: AppHandle) {
             // queued at all.
             post(enqueue).layer(DefaultBodyLimit::max(ENQUEUE_BODY_LIMIT)),
         )
+        .route("/v1/formats", post(formats))
         .route("/v1/queue", get(queue_state))
         .route("/v1/log/{id}", get(download_log))
         .route("/v1/cookies", post(cookies_export))
@@ -439,6 +440,8 @@ async fn enqueue(
         || payload.open_app.is_some()
         || payload.page_url.is_some()
         || payload.user_agent.is_some()
+        || payload.quality.is_some()
+        || payload.format_id.is_some()
     {
         if let Err(error) = write_extension_metadata(&payload) {
             tracing::warn!("failed to write extension metadata: {error}");
@@ -479,6 +482,165 @@ async fn enqueue(
         message: None,
     });
     (StatusCode::OK, body).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FormatsRequest {
+    url: String,
+    #[serde(default)]
+    referer: Option<String>,
+    #[serde(default)]
+    cookies: Vec<ExtensionCookie>,
+    #[serde(default)]
+    protocol_version: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct QualityItem {
+    /// Human label as produced by the extractor, e.g. `"1080p (HD)"`.
+    label: String,
+    /// Quality string to send back on `/v1/enqueue` — `"1080p"` or `"best"`.
+    value: String,
+    width: u32,
+    height: u32,
+    format: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FormatsResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbnail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_seconds: Option<f64>,
+    qualities: Vec<QualityItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// `POST /v1/formats`: probe the URL and return the list of available
+/// resolutions so the extension can render an in-page picker (IDM-style)
+/// without opening the desktop UI. Same bearer as `/v1/enqueue`.
+async fn formats(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Json(request): Json<FormatsRequest>,
+) -> Response {
+    if !check_bearer(&headers, &state.token) {
+        return unauthorized();
+    }
+
+    if let Some(client_version) = request.protocol_version {
+        if client_version > HOST_MAX_PROTOCOL_VERSION {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "UNSUPPORTED_PROTOCOL",
+                format!(
+                    "Extension protocol v{client_version} is newer than host v{HOST_MAX_PROTOCOL_VERSION}. Please update OmniGet."
+                ),
+            );
+        }
+    }
+
+    if !crate::external_url::is_external_url(&request.url) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_URL",
+            "The requested URL is invalid".to_string(),
+        );
+    }
+
+    // Ingest cookies first so authenticated probes (age-gated / private media)
+    // resolve the same formats the eventual download will see.
+    if !request.cookies.is_empty() && request.cookies.len() <= cookie_limit() {
+        if let Err(error) = crate::cookies::ingest_batch(
+            &request.cookies,
+            crate::cookies::IngestSource {
+                source_url: request
+                    .referer
+                    .clone()
+                    .or_else(|| Some(request.url.clone())),
+                source_label: "Browser extension (formats probe)".to_string(),
+                alias_hint: None,
+            },
+        ) {
+            tracing::warn!("failed to ingest cookies for formats probe: {error}");
+        }
+    }
+
+    let app_state = state.app.state::<crate::AppState>();
+    let resolved = match crate::core::url_resolver::resolve_downloader(
+        &app_state.registry,
+        &request.url,
+    )
+    .await
+    {
+        Some(r) => r,
+        None => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "NO_DOWNLOADER",
+                "No downloader available for this URL".to_string(),
+            );
+        }
+    };
+
+    let media = match resolved.downloader.get_media_info(&request.url).await {
+        Ok(info) => info,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "PROBE_FAILED",
+                format!("Could not read media info: {error}"),
+            );
+        }
+    };
+
+    let mut qualities: Vec<QualityItem> = media
+        .available_qualities
+        .iter()
+        .map(|q| {
+            let value = if q.height > 0 {
+                format!("{}p", q.height)
+            } else {
+                "best".to_string()
+            };
+            QualityItem {
+                label: q.label.clone(),
+                value,
+                width: q.width,
+                height: q.height,
+                format: q.format.clone(),
+            }
+        })
+        .collect();
+
+    // De-duplicate by the `value` string (several formats can map to the same
+    // height bucket), preserving the extractor's ordering (highest first).
+    let mut seen = std::collections::HashSet::new();
+    qualities.retain(|q| seen.insert(q.value.clone()));
+
+    let media_type = format!("{:?}", media.media_type).to_lowercase();
+
+    let body = FormatsResponse {
+        ok: true,
+        title: Some(media.title).filter(|s| !s.is_empty()),
+        thumbnail: media.thumbnail_url,
+        media_type: Some(media_type),
+        duration_seconds: media.duration_seconds,
+        qualities,
+        code: None,
+        message: None,
+    };
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 async fn cookies_export(
