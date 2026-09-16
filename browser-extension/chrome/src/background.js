@@ -19,6 +19,7 @@ import {
   sendViaBridge,
   sendCookiesViaBridge,
   getFormatsViaBridge,
+  ensureBridgeReady,
   autoPair,
   loadBridgeConfig,
   AUTOPAIR_ALARM_NAME,
@@ -36,10 +37,9 @@ async function isPaired() {
   }
 }
 
-// Keep a low-frequency poll alive while unpaired so that, the moment the user
-// clicks "Pair extension" in the desktop app (which opens a ~120s single-use
-// window), the extension grabs the token on its own — no copy-paste, no
-// returning to the extension. The alarm clears itself once paired.
+// Keep a low-frequency poll alive while unpaired so the token is grabbed as
+// soon as OmniGet is running. Users never open Settings or paste anything.
+// The alarm clears itself once paired.
 async function runAutoPairTick() {
   if (await isPaired()) {
     try {
@@ -74,8 +74,8 @@ if (chrome.alarms?.onAlarm) {
 }
 
 // If the stored token is ever cleared (401 recovery in bridge-client.js, or
-// the user wiping it from the options page), go back to polling for a fresh
-// pairing window so the browser can re-pair without a reinstall.
+// the user wiping it from the options page), resume polling so the next
+// download re-pairs on its own.
 if (chrome.storage?.onChanged) {
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local") return;
@@ -161,32 +161,65 @@ async function injectVideoDetectIntoOpenTabs() {
   }
 }
 
-chrome.runtime.onInstalled.addListener(async (details) => {
+if (chrome.permissions?.onAdded) {
+  chrome.permissions.onAdded.addListener(() => {
+    injectVideoDetectIntoOpenTabs().catch(() => {});
+  });
+}
+
+const BRIDGE_RETRY_REASONS = new Set([
+  "fetch-failed",
+  "missing-endpoint",
+  "no-endpoint",
+  "missing-token",
+  "unauthorized",
+  "window-closed",
+]);
+
+async function pairIfNeeded() {
+  if (await isPaired()) return true;
+  const result = await autoPair().catch(() => ({ ok: false }));
+  return Boolean(result?.ok);
+}
+
+async function withLiveBridge(run) {
+  const ready = await ensureBridgeReady({
+    openScheme: (url) => openOmnigetScheme(url),
+    attempts: 40,
+    intervalMs: 400,
+  });
+  if (!ready.ok) {
+    return {
+      ok: false,
+      reason: "app-not-running",
+      message: "OmniGet backend is not running.",
+    };
+  }
+  await pairIfNeeded();
+
+  let result = await run();
+  if (result?.ok) return result;
+  if (!BRIDGE_RETRY_REASONS.has(result?.reason)) return result;
+
+  await pairIfNeeded();
+  result = await run();
+  if (result?.ok) return result;
+  if (result?.reason === "missing-token" || result?.reason === "unauthorized") {
+    await autoPair().catch(() => ({ ok: false }));
+    result = await run();
+  }
+  return result;
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
   registerContextMenu();
   refreshActiveTab().catch(() => {});
   injectVideoDetectIntoOpenTabs().catch(() => {});
-  // Surface the pairing page on any install/update *if the user hasn't
-  // already paired this browser*. Reloading an unpacked extension fires
-  // `update`, not `install`, so gating only on `install` would silently
-  // skip the onboarding flow for dev builds and users coming from a
-  // pre-bridge OmniGet version.
-  if (typeof chrome.runtime.openOptionsPage !== "function") return;
-  try {
-    const stored = await chrome.storage.local.get("bridge_token");
-    const token = typeof stored?.bridge_token === "string" ? stored.bridge_token.trim() : "";
-    if (!token) {
-      const paired = await runAutoPairTick();
-      if (!paired) {
-        await ensureAutoPairAlarm();
-        chrome.runtime.openOptionsPage().catch(() => {});
-      }
-    }
-  } catch {
-    // storage unavailable — fall back to the previous behaviour and only
-    // open on a real install.
-    if (details?.reason === "install") {
-      chrome.runtime.openOptionsPage().catch(() => {});
-    }
+  // Pair silently. Never pop the options page — users should not have to
+  // visit Settings or paste a token.
+  if (!(await isPaired())) {
+    const paired = await runAutoPairTick();
+    if (!paired) await ensureAutoPairAlarm();
   }
 });
 
@@ -312,6 +345,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "sendToOmniGet") {
     handleSendToApp(msg).then(sendResponse);
+    return true;
+  }
+
+  if (msg.type === "injectVideoDetectAll") {
+    injectVideoDetectIntoOpenTabs()
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse({ ok: false }));
     return true;
   }
 
@@ -481,7 +521,7 @@ async function handleGetFormats(msg) {
   const cookies = await gatherCookiesForRequest(url, url, platform);
   const payload = { url, referer: url };
   if (cookies && cookies.length > 0) payload.cookies = cookies;
-  return getFormatsViaBridge(payload);
+  return withLiveBridge(() => getFormatsViaBridge(payload));
 }
 
 async function handleSendToApp(msg) {
@@ -531,7 +571,9 @@ async function handleSendToApp(msg) {
   }
   if (msg.contentType) message.contentType = msg.contentType;
   if (msg.headers) message.headers = msg.headers;
-  if (typeof msg.openApp === "boolean") message.openApp = msg.openApp;
+  // In-page downloads run against the hidden backend. Only raise the GUI when
+  // the caller explicitly asks (toolbar popup toggle).
+  message.openApp = msg.openApp === true;
   message.pageUrl = msg.referer || "";
   message.userAgent = navigator.userAgent;
 
@@ -550,17 +592,17 @@ async function handleSendToApp(msg) {
 
   const cookieSummary = summarizeCookies(cookies);
 
-  // Primary path: localhost HTTP bridge (no extension-ID dependency, full
-  // cookie + metadata payload).
-  const bridgeResult = await sendViaBridge(message);
+  // Primary path: localhost HTTP bridge. If the desktop process is asleep,
+  // wake it as a backend (no window) and retry before falling back to the
+  // omniget:// scheme.
+  const bridgeResult = await withLiveBridge(() => sendViaBridge(message));
   if (bridgeResult?.ok) {
     return { ok: true, viaBridge: true, cookieSummary };
   }
 
   // Fallback: omniget:// scheme handler. The desktop app is launched (or
-  // brought to focus) and the URL is queued, but cookies aren't forwarded
-  // — the user can pair the bridge from the extension's options page to
-  // get the full experience.
+  // brought to focus) and the URL is queued, but cookies aren't forwarded.
+  // Pairing happens automatically on the next successful bridge handshake.
   const schemeResult = await openOmnigetScheme(url);
   if (schemeResult?.ok) {
     return { ok: true, viaScheme: true, cookieSummary, bridgeReason: bridgeResult?.reason };
@@ -730,7 +772,7 @@ async function capturePlatformCookies(platform, force = false) {
     return { ok: false, reason: "no_cookies" };
   }
 
-  const response = await sendCookiesViaBridge(cookies);
+  const response = await withLiveBridge(() => sendCookiesViaBridge(cookies));
   if (response.ok) {
     console.info("[OmniGet] cookies exported", platform, cookies.length, response);
     return { ok: true, count: cookies.length, response };

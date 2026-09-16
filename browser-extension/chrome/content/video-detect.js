@@ -1,7 +1,9 @@
 // OmniGet in-page download button (IDM-style).
 //
-// Shows a floating "Download" button whenever the current page has a playable
-// video (a real <video> element) or is a supported media platform. Clicking it
+// Shows a floating "Download" button only when this tab actually has a
+// downloadable media object (a real <video>/<audio> player, or a known embed)
+// and parks the button directly under that object. Tabs with no media — search
+// pages, homepages, settings, articles without a player — stay clean.
 // asks the desktop app (through the background service worker → local bridge)
 // for the list of available resolutions and renders an in-page picker; choosing
 // a resolution starts the download immediately at that quality.
@@ -21,41 +23,96 @@
   if (window.__omnigetIdmLoaded) return;
   window.__omnigetIdmLoaded = true;
 
-  // Hostnames we know the desktop app can handle. Keep in loose sync with
-  // src/detect.js — this is only used to decide whether to offer the button on
-  // pages that have no <video> element yet (SPA shells, embeds, audio).
-  const SUPPORTED_HOST_RE =
-    /(^|\.)(youtube\.com|youtube-nocookie\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|vxtwitter\.com|fixvx\.com|reddit\.com|redd\.it|twitch\.tv|pinterest\.[\w.]+|pin\.it|bsky\.app|t\.me|telegram\.(me|org)|vimeo\.com|bilibili\.com|b23\.tv|soundcloud\.com|dailymotion\.com|facebook\.com|streamable\.com)$/i;
-
   const NS_SVG = "http://www.w3.org/2000/svg";
 
   let host, shadow, fab, panel;
   let panelOpen = false;
   let currentUrl = location.href;
+  let posPending = false;
 
-  function isSupportedHost() {
-    try {
-      return SUPPORTED_HOST_RE.test(new URL(location.href).hostname);
-    } catch {
-      return false;
-    }
+  function isPreviewChrome(el) {
+    return Boolean(
+      el.closest(
+        [
+          "ytd-video-preview",
+          "ytd-moving-thumbnail-renderer",
+          "ytd-thumbnail",
+          ".ytp-inline-preview-ui",
+          ".html5-video-player.unstarted-mode",
+          "[class*='inline-preview']",
+          "[class*='hover-preview']",
+        ].join(",")
+      )
+    );
   }
 
-  // A "real" video is one that is reasonably sized and has (or will have) a
-  // source. Tiny hidden <video> tags used for previews/ads are ignored.
-  function hasPlayableVideo() {
-    const vids = document.querySelectorAll("video");
-    for (const v of vids) {
-      const r = v.getBoundingClientRect();
-      const big = r.width >= 200 && r.height >= 150;
-      const hasSrc = v.currentSrc || v.src || v.querySelector("source");
-      if (big && (hasSrc || v.readyState > 0)) return true;
-    }
-    return false;
+  function hasMediaSource(el) {
+    if (el.currentSrc || el.src) return true;
+    if (el.querySelector && el.querySelector("source[src]")) return true;
+    return el.readyState > 0;
   }
 
-  function shouldShow() {
-    return isSupportedHost() || hasPlayableVideo();
+  function playerBox(el) {
+    const wrap =
+      el.closest("#movie_player") ||
+      el.closest(".html5-video-player") ||
+      el.closest("[data-testid='videoPlayer']") ||
+      el.closest("figure") ||
+      el.parentElement;
+    const box = wrap && wrap.getBoundingClientRect().height >= 40 ? wrap : el;
+    return box.getBoundingClientRect();
+  }
+
+  // The actual thing the user would download: the playing player if there is
+  // one, otherwise the largest real <video>/<audio>, otherwise a known embed.
+  // Homepage shells, hover previews and ads do not count.
+  function findDownloadTarget() {
+    const media = document.querySelectorAll("video, audio");
+    const scored = [];
+    for (const el of media) {
+      if (isPreviewChrome(el)) continue;
+      if (!hasMediaSource(el)) continue;
+      const r = playerBox(el);
+      const isAudio = el.tagName === "AUDIO";
+      const minW = isAudio ? 80 : 280;
+      const minH = isAudio ? 12 : 160;
+      if (r.width < minW || r.height < minH) continue;
+      const playing = !el.paused && !el.ended && el.readyState > 1;
+      scored.push({
+        el,
+        rect: r,
+        playing,
+        area: r.width * r.height,
+      });
+    }
+    if (scored.length) {
+      scored.sort((a, b) => {
+        if (a.playing !== b.playing) return a.playing ? -1 : 1;
+        return b.area - a.area;
+      });
+      return scored[0];
+    }
+
+    const embeds = document.querySelectorAll("iframe[src]");
+    for (const frame of embeds) {
+      let src = "";
+      try {
+        src = frame.src || "";
+      } catch {
+        continue;
+      }
+      if (
+        !/(youtube\.com\/embed|youtube-nocookie\.com\/embed|player\.vimeo\.com|player\.twitch\.tv|tiktok\.com\/embed|dailymotion\.com\/embed|facebook\.com\/plugins\/video)/i.test(
+          src
+        )
+      ) {
+        continue;
+      }
+      const r = frame.getBoundingClientRect();
+      if (r.width < 280 || r.height < 160) continue;
+      return { el: frame, rect: r, playing: true, area: r.width * r.height };
+    }
+    return null;
   }
 
   // ── DOM builders (no innerHTML) ───────────────────────────────────────────
@@ -123,12 +180,19 @@
   // ── UI ────────────────────────────────────────────────────────────────
 
   function ensureRoot() {
-    if (host) return;
-    host = document.createElement("div");
-    host.id = "omniget-idm-root";
-    host.style.cssText =
-      "all:initial;position:fixed;z-index:2147483647;bottom:20px;right:20px;";
-    shadow = host.attachShadow({ mode: "open" });
+    if (host) {
+      if (!host.isConnected) {
+        const parent = document.documentElement || document.body;
+        if (parent) parent.appendChild(host);
+      }
+      return;
+    }
+    try {
+      host = document.createElement("div");
+      host.id = "omniget-idm-root";
+      host.style.cssText =
+        "position:fixed;z-index:2147483647;top:0;left:0;display:none;pointer-events:none;";
+      shadow = host.attachShadow({ mode: "open" });
 
     const style = document.createElement("style");
     style.textContent = `
@@ -141,21 +205,23 @@
         box-shadow: 0 6px 20px rgba(0,0,0,.28);
         font-size: 14px; font-weight: 600; line-height: 1;
         transition: transform .15s ease, box-shadow .15s ease, opacity .2s ease;
-        user-select: none;
+        user-select: none; pointer-events: auto;
       }
       .fab:hover { transform: translateY(-1px); box-shadow: 0 8px 26px rgba(0,0,0,.34); }
       .fab:active { transform: translateY(0); }
       .fab .label { white-space: nowrap; }
       .panel {
-        position: absolute; bottom: 56px; right: 0;
+        position: absolute; top: 48px; right: auto; left: 0; bottom: auto;
         min-width: 240px; max-width: 320px;
         background: #1c1c1e; color: #fff; border-radius: 14px;
         box-shadow: 0 12px 40px rgba(0,0,0,.45);
-        overflow: hidden; opacity: 0; transform: translateY(8px) scale(.98);
+        overflow: hidden; opacity: 0; transform: translateY(-8px) scale(.98);
         transition: opacity .16s ease, transform .16s ease;
         pointer-events: none;
       }
       .panel.open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+      .panel.drop-up { top: auto; bottom: 48px; transform: translateY(8px) scale(.98); }
+      .panel.drop-up.open { transform: translateY(0) scale(1); }
       .panel-header {
         padding: 12px 14px; font-size: 13px; font-weight: 600;
         border-bottom: 1px solid rgba(255,255,255,.08);
@@ -180,7 +246,7 @@
       .state { padding: 16px 14px; font-size: 13px; opacity: .85; display:flex; align-items:center; gap:10px; }
       .state.err { color: #ff9a8b; }
       .toast {
-        position: absolute; bottom: 56px; right: 0;
+        position: absolute; top: 48px; left: 0; right: auto; bottom: auto;
         background: #1c1c1e; color: #fff; border-radius: 12px;
         padding: 10px 14px; font-size: 13px; font-weight: 500;
         box-shadow: 0 12px 40px rgba(0,0,0,.45); white-space: nowrap;
@@ -203,6 +269,48 @@
     shadow.appendChild(panel);
 
     document.documentElement.appendChild(host);
+    } catch (err) {
+      host = null;
+      shadow = null;
+      fab = null;
+      panel = null;
+      console.warn("[OmniGet] in-page button failed to mount", err);
+    }
+  }
+
+  function positionHost() {
+    if (!host) return;
+    const target = findDownloadTarget();
+    if (!target) {
+      host.style.display = "none";
+      return;
+    }
+    const r = target.rect;
+    const gap = 8;
+    const btnH = 44;
+    let top = r.bottom + gap;
+    let dropUp = false;
+    if (top + btnH > window.innerHeight - 8) {
+      top = Math.max(8, r.bottom - btnH - gap);
+      dropUp = true;
+    }
+    if (top < 8) top = 8;
+    const left = Math.max(8, Math.min(r.left, window.innerWidth - 160));
+    host.style.display = "block";
+    host.style.top = `${Math.round(top)}px`;
+    host.style.left = `${Math.round(left)}px`;
+    host.style.right = "auto";
+    host.style.bottom = "auto";
+    if (panel) panel.classList.toggle("drop-up", dropUp);
+  }
+
+  function schedulePosition() {
+    if (posPending) return;
+    posPending = true;
+    requestAnimationFrame(() => {
+      posPending = false;
+      update();
+    });
   }
 
   function showToast(text, kind) {
@@ -290,7 +398,11 @@
     setFabLoading(true);
     renderState("Fetching available resolutions…");
     try {
-      const res = await sendMessage({ type: "getFormats", url: location.href });
+      const res = await sendMessage({
+        type: "getFormats",
+        url: location.href,
+        openApp: false,
+      });
       if (res && res.ok) {
         renderQualities(res);
       } else {
@@ -310,6 +422,7 @@
         type: "downloadWithQuality",
         url: location.href,
         quality,
+        openApp: false,
       });
       closePanel();
       if (res && res.ok) {
@@ -325,17 +438,29 @@
 
   function errorText(res) {
     if (!res) return "No response from the OmniGet app.";
-    if (res.reason === "missing-token" || res.reason === "unauthorized")
-      return "Extension not paired. Open OmniGet → Settings → Pair extension.";
-    if (res.reason === "missing-endpoint" || res.reason === "fetch-failed")
-      return "OmniGet app not reachable. Make sure it's running.";
+    if (
+      res.reason === "missing-token" ||
+      res.reason === "unauthorized" ||
+      res.reason === "missing-endpoint" ||
+      res.reason === "fetch-failed" ||
+      res.reason === "app-not-running" ||
+      res.reason === "window-closed"
+    ) {
+      return "OmniGet isn't running. Start the app once — it can stay in the tray.";
+    }
     return res.message || "Couldn't read the available formats.";
   }
 
   function shortError(res) {
     if (!res) return "Download failed";
-    if (res.reason === "missing-token" || res.reason === "unauthorized")
-      return "Pair the extension in OmniGet settings";
+    if (
+      res.reason === "missing-token" ||
+      res.reason === "unauthorized" ||
+      res.reason === "app-not-running" ||
+      res.reason === "fetch-failed"
+    ) {
+      return "Start OmniGet and try again";
+    }
     return res.error || res.message || "Download failed";
   }
 
@@ -358,9 +483,9 @@
   // ── Visibility management ────────────────────────────────────────────────
 
   function update() {
-    if (shouldShow()) {
+    if (findDownloadTarget()) {
       ensureRoot();
-      if (host) host.style.display = "block";
+      positionHost();
     } else if (host) {
       host.style.display = "none";
       closePanel();
@@ -383,8 +508,8 @@
     if (location.href !== currentUrl) {
       currentUrl = location.href;
       closePanel();
-      update();
     }
+    update();
   }, 1000);
 
   // Close the panel when clicking elsewhere on the page.
@@ -397,6 +522,12 @@
     },
     true
   );
+
+  window.addEventListener("scroll", schedulePosition, true);
+  window.addEventListener("resize", schedulePosition);
+  document.addEventListener("play", schedulePosition, true);
+  document.addEventListener("pause", schedulePosition, true);
+  document.addEventListener("loadedmetadata", schedulePosition, true);
 
   function start() {
     update();
